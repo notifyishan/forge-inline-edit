@@ -33,9 +33,9 @@ The extension uses Node and VS Code APIs and requires no bundling. Check its Jav
 
 | Capability | Implementation |
 | --- | --- |
-| Context | Agent-driven literal search with ranked path and line matches, bounded reads and support for explicit file and symbol mentions in the request. |
+| Context | Ranked path and line matches, up to 9,000 characters of numbered starter excerpts, additional agent-driven search and bounded reads, and explicit file and symbol mentions. |
 | Tools | Search and read, propose edits against numbered ranges in a frozen source snapshot, and run read-only Git status or diff statistics. All edits remain in memory. |
-| Review | A VS Code side-by-side preview per proposed edit. Choose Accept, Reject or Cancel All. Forge checks the current file contents before applying the accepted set. Use VS Code Undo to reverse it. |
+| Review | A VS Code side-by-side preview per proposed edit. Choose Accept, Reject or Cancel All. Forge checks the current contents before applying the accepted set and syntax-checks Python proposals when Python is available. Use VS Code Undo to reverse an applied edit. |
 | Failure handling | The client reads TrueForge server-sent events, sets a generation deadline, and asks TrueForge to cancel the turn if local generation stops early. |
 
 ## Limitations

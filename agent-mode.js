@@ -91,6 +91,7 @@ async function agentMode(prompt, output) {
       const { manifest } = connector;
       await request("/settings/mcp-servers", signal, { method: "POST", body: { manifest } });
       const hints = await workspace.suggestPaths(prompt);
+      const excerpts = await workspace.startingExcerpts(hints);
       const activePath = active && vscode.workspace.getWorkspaceFolder(active.uri) === folder
         ? path.relative(folder.uri.fsPath, active.uri.fsPath).split(path.sep).join("/")
         : undefined;
@@ -101,6 +102,7 @@ async function agentMode(prompt, output) {
           prompt,
           activePath && "Active editor: " + activePath,
           hints.length && "Automatically discovered candidate paths and line landmarks: " + JSON.stringify(hints),
+          excerpts.length && "Numbered starter excerpts. These ranges can already be used for edit proposals: " + JSON.stringify(excerpts),
         ].filter(Boolean).join("\n\n"),
         spec: {
           ...agentSpec,

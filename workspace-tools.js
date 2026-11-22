@@ -2,12 +2,25 @@ const http = require("node:http");
 const { randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { realpath } = require("node:fs/promises");
-const { execFile } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const vscode = require("vscode");
 
 const exec = promisify(execFile);
 const CONNECTOR = "forge-workspace";
+const PYTHON_CHECK = [
+  "import ast, json, sys",
+  "previous, proposed = json.loads(sys.stdin.buffer.read())",
+  "original = ast.parse(previous)",
+  "updated = ast.parse(proposed)",
+  "from collections import Counter",
+  "def definitions(tree):",
+  "    return Counter(node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))",
+  "before, after = definitions(original), definitions(updated)",
+  "duplicates = sorted(name for name in after if after[name] > max(1, before[name]))",
+  "if duplicates:",
+  "    raise ValueError('Duplicate top-level definitions: ' + ', '.join(duplicates))",
+].join("\n");
 const schema = (properties, required = Object.keys(properties)) => ({
   type: "object", properties, required, additionalProperties: false,
 });
@@ -54,6 +67,30 @@ const tools = [
 ];
 
 let activeRun;
+
+async function checkPython(file, projected, signal) {
+  await new Promise((resolve, reject) => {
+    const child = spawn("python", ["-I", "-c", PYTHON_CHECK], {
+      windowsHide: true, stdio: ["pipe", "ignore", "pipe"], signal,
+    });
+    let errorText = "";
+    const timeout = setTimeout(() => child.kill(), 5000);
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (text) => { errorText = (errorText + text).slice(-1600); });
+    child.stdin.on("error", () => {});
+    child.once("error", (error) => {
+      if (error.code === "ENOENT") resolve();
+      else reject(error);
+    });
+    child.once("close", (status) => {
+      clearTimeout(timeout);
+      if (status === 0) resolve();
+      else reject(new Error(file.path + " failed Python validation: " +
+        (errorText.trim().split("\n").at(-1) || "Python validation timed out.")));
+    });
+    child.stdin.end(JSON.stringify([file.original, projected]));
+  });
+}
 
 async function startServer() {
   const token = randomBytes(32).toString("hex");
@@ -240,20 +277,23 @@ async function openWorkspaceTools(folder, signal, onTool) {
     const first = args.start_line;
     const last = args.end_line ?? first;
     const insert = args.operation === "insert_before";
+    const ranges = seenRanges.get(file.path) || [];
     if ((!insert && args.operation !== "replace") || !Number.isInteger(first) ||
         !Number.isInteger(last) || last < first || last - first >= 240 ||
         (insert && last !== first) || typeof args.text !== "string" || args.text.length > 24000 ||
-        !seenRanges.get(file.path)?.some((range) => first >= range.start && last <= range.last)) {
-      throw new Error("Use valid line numbers from a successfully read range in " + file.path + ".");
+        !ranges.some((range) => first >= range.start && last <= range.last)) {
+      const available = ranges.slice(-6).map(({ start, last }) => start + "–" + last).join(", ");
+      throw new Error("Use valid original line numbers in " + file.path +
+        (available ? ". Recently read ranges: " + available + "." : ". Read the target area first."));
     }
     const starts = [0, ...Array.from(file.original.matchAll(/\n/g), (match) => match.index + 1)];
     const start = starts[first - 1];
     const end = insert ? start : starts[last] ?? file.original.length;
     const eol = file.original.includes("\r\n") ? "\r\n" : "\n";
     let replacement = args.text;
-    if (!replacement.includes("\n") && /\\n(?=\\n|[ \t]+\S)/.test(replacement)) {
+    if (/\\n(?=\\n|[ \t]+\S)|\\"/.test(replacement) && !/(?<!\\)"/.test(replacement)) {
       try {
-        replacement = JSON.parse('"' + replacement + '"');
+        replacement = JSON.parse('"' + replacement.replace(/\r?\n/g, "\\n") + '"');
       } catch {
         // Keep literal source text if the argument is not an extra JSON string.
       }
@@ -276,6 +316,15 @@ async function openWorkspaceTools(folder, signal, onTool) {
       }
       const pending = [];
       for (const edit of edits) pending.push(await validateEdit(edit, pending));
+      for (const relative of new Set(pending.map((edit) => edit.path))) {
+        if (!relative.endsWith(".py")) continue;
+        const file = files.get(relative);
+        let projected = file.original;
+        for (const edit of [...changes, ...pending].filter((change) => change.path === relative).sort((a, b) => b.start - a.start)) {
+          projected = projected.slice(0, edit.start) + edit.after + projected.slice(edit.end);
+        }
+        await checkPython(file, projected, signal);
+      }
       signal.throwIfAborted();
       changes.push(...pending);
       return pending.map(({ path, line }) => ({ queued: true, path, line }));
@@ -321,6 +370,31 @@ async function openWorkspaceTools(folder, signal, onTool) {
           .slice(0, 12).map(({ line, label }) => [line, label]).sort((a, b) => a[0] - b[0]);
         return hint;
       }));
+    },
+    async startingExcerpts(hints) {
+      const excerpts = [];
+      let remaining = 9000;
+      const groups = [
+        hints.find(({ path }) => path.startsWith("src/")),
+        hints.find(({ path }) => path.startsWith("tests/")),
+        hints.find(({ path }) => path.startsWith("docs/")),
+      ].filter(Boolean);
+      for (const hint of groups) {
+        const landmarks = hint.landmarks || [];
+        const anchors = landmarks.filter(([, name]) => /\.add_command\(|^[a-z_]\w* = [A-Z]\w*\(/.test(name));
+        const seeds = (anchors.length ? [anchors[0], anchors.at(-1)] : landmarks.slice(0, 3));
+        for (const line of new Set(seeds.map(([line]) => line))) {
+          const range = await excerpt({ path: hint.path, start_line: Math.max(1, line - 4), end_line: line + 9 })
+            .catch(() => undefined);
+          if (!range) continue;
+          const size = range.text.length;
+          if (size <= remaining) {
+            excerpts.push(range);
+            remaining -= size;
+          }
+        }
+      }
+      return excerpts;
     },
     async call(name, args) {
       signal.throwIfAborted();
