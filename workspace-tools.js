@@ -39,8 +39,8 @@ const proposedEdit = schema({
   operation: { enum: ["insert_before", "replace"] },
   start_line: line,
   end_line: line,
-  text: { type: "string" },
-}, ["path", "operation", "start_line", "text"]);
+  lines: { type: "array", maxItems: 240, items: { type: "string" } },
+}, ["path", "operation", "start_line", "lines"]);
 const tools = [
   {
     name: "search_workspace",
@@ -50,7 +50,7 @@ const tools = [
   },
   {
     name: "read_file",
-    description: "Read an exact source excerpt with its first and last line numbers. Limit each read to 180 lines.",
+    description: "Read an exact source excerpt with its first and last line numbers. Limit each read to 240 lines.",
     inputSchema: readRange,
     annotations: { readOnlyHint: true },
   },
@@ -62,7 +62,7 @@ const tools = [
   },
   {
     name: "propose_edits",
-    description: "Queue edits using original line numbers. Include all hunks for each file in the batch: a valid batch replaces previous proposals for its named files. Hunks in other files stay queued. insert_before adds complete lines before start_line; replace covers the inclusive start_line to end_line range. Omit line number prefixes from text. Invalid batches leave existing proposals intact.",
+    description: "Queue edits using original line numbers. Supply replacement source as lines, one string per physical line, including empty strings for blank lines. Omit line number prefixes and preserve indentation. A valid batch replaces previous proposals for its named files. insert_before adds lines before start_line. replace covers the inclusive range. Invalid batches leave existing proposals intact.",
     inputSchema: schema({ edits: { type: "array", minItems: 1, maxItems: 12, items: proposedEdit } }),
   },
   {
@@ -287,26 +287,23 @@ async function openWorkspaceTools(folder, signal, onTool) {
     const ranges = seenRanges.get(file.path) || [];
     if ((!insert && args.operation !== "replace") || !Number.isInteger(first) ||
         !Number.isInteger(last) || last < first || last - first >= 240 ||
-        (insert && last !== first) || typeof args.text !== "string" || args.text.length > 24000 ||
+        (insert && last !== first) ||
         !ranges.some((range) => first >= range.start && last <= range.last)) {
       const available = ranges.slice(-6).map(({ start, last }) => start + "–" + last).join(", ");
-      throw new Error("Use valid original line numbers in " + file.path +
+      throw new Error("Line " + first + " is outside the ranges read in " + file.path +
         (available ? ". Recently read ranges: " + available + "." : ". Read the target area first."));
+    }
+    if (!Array.isArray(args.lines) || args.lines.length > 240 ||
+        args.lines.some((source) => typeof source !== "string" || /[\r\n]/.test(source))) {
+      throw new Error("Supply one string per source line in the lines array.");
     }
     const starts = [0, ...Array.from(file.original.matchAll(/\n/g), (match) => match.index + 1)];
     const start = starts[first - 1];
     const end = insert ? start : starts[last] ?? file.original.length;
     const eol = file.original.includes("\r\n") ? "\r\n" : "\n";
-    let replacement = args.text;
-    if (/\\n(?=\\n|[ \t]+\S)|\\"/.test(replacement) && !/(?<!\\)"/.test(replacement)) {
-      try {
-        replacement = JSON.parse('"' + replacement.replace(/\r?\n/g, "\\n") + '"');
-      } catch {
-        // Keep literal source text if the argument is not an extra JSON string.
-      }
-    }
-    let after = replacement.replace(/\r\n|\r|\n/g, eol);
-    if (after && (end < file.original.length || file.original.endsWith("\n")) && !after.endsWith(eol)) after += eol;
+    let after = args.lines.join(eol);
+    if (after.length > 24000) throw new Error("Replacement text exceeds 24,000 characters.");
+    if (args.lines.length && (end < file.original.length || file.original.endsWith("\n"))) after += eol;
     if (file.original.slice(start, end) === after ||
         pending.some((item) => item.path === file.path &&
           (item.start === start || (start < item.end && end > item.start)))) {
@@ -329,11 +326,20 @@ async function openWorkspaceTools(folder, signal, onTool) {
       for (const relative of editedPaths) {
         if (!relative.endsWith(".py")) continue;
         const file = files.get(relative);
-        let projected = file.original;
-        for (const edit of pending.filter((change) => change.path === relative).sort((a, b) => b.start - a.start)) {
-          projected = projected.slice(0, edit.start) + edit.after + projected.slice(edit.end);
+        const edits = pending.filter((change) => change.path === relative).sort((a, b) => b.start - a.start);
+        const project = (replacements) => edits.reduce((source, { start, end }, index) =>
+          source.slice(0, start) + replacements[index] + source.slice(end), file.original);
+        const originalText = edits.map(({ after }) => after);
+        try {
+          await checkPython(file, project(originalText), signal);
+        } catch (error) {
+          if (!error.message.includes("unexpected character after line continuation character")) throw error;
+          const decoded = originalText.map((after) => after.split(/(?<=\n)/).map((source) =>
+            /(?<!\\)["']/.test(source) ? source : source.replace(/\\(["'])/g, "$1")).join(""));
+          if (decoded.every((source, index) => source === originalText[index])) throw error;
+          await checkPython(file, project(decoded), signal);
+          edits.forEach((edit, index) => { edit.after = decoded[index]; });
         }
-        await checkPython(file, projected, signal);
       }
       signal.throwIfAborted();
       changes.splice(0, changes.length, ...retained, ...pending);
