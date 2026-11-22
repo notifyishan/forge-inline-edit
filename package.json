@@ -1,0 +1,38 @@
+{
+  "name": "forge-extension",
+  "displayName": "Forge Inline Edit",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Forge Inline Edit",
+      "properties": {
+        "forgeExtension.model": {
+          "type": "string",
+          "default": "google-gemini/gemini-3-1-flash-lite",
+          "description": "Model name configured in TrueForge, in provider/model format."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "forgeExtension.inlineEdit",
+        "key": "ctrl+k ctrl+shift+e",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ],
+    "commands": [
+      {
+        "command": "forgeExtension.inlineEdit",
+        "title": "Forge: Inline Edit"
+      },
+      {
+        "command": "forgeExtension.agentMode",
+        "title": "Forge: Agent Mode"
+      }
+    ]
+  }
+}
