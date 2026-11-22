@@ -20,6 +20,13 @@ const PYTHON_CHECK = [
   "duplicates = sorted(name for name in after if after[name] > max(1, before[name]))",
   "if duplicates:",
   "    raise ValueError('Duplicate top-level definitions: ' + ', '.join(duplicates))",
+  "def decorations(tree):",
+  "    return {node.name: {ast.dump(item) for item in node.decorator_list} for node in tree.body if hasattr(node, 'decorator_list')}",
+  "old_decorators, new_decorators = decorations(original), decorations(updated)",
+  "added_decorators = set().union(*(items for name, items in new_decorators.items() if name not in old_decorators))",
+  "for name in old_decorators.keys() & new_decorators.keys():",
+  "    if (old_decorators[name] - new_decorators[name]) & added_decorators:",
+  "        raise ValueError('Insertion split the decorators for ' + name + '. Insert outside its complete decorator block.')",
 ].join("\n");
 const schema = (properties, required = Object.keys(properties)) => ({
   type: "object", properties, required, additionalProperties: false,
@@ -55,7 +62,7 @@ const tools = [
   },
   {
     name: "propose_edits",
-    description: "Queue a batch of edits against exact line numbers from read_file or read_files. insert_before inserts complete lines immediately before start_line. replace replaces the inclusive range from start_line to end_line. Leave all line number prefixes out of text. If any edit is invalid, nothing in this batch queues.",
+    description: "Queue edits using original line numbers. Include all hunks for each file in the batch: a valid batch replaces previous proposals for its named files. Hunks in other files stay queued. insert_before adds complete lines before start_line; replace covers the inclusive start_line to end_line range. Omit line number prefixes from text. Invalid batches leave existing proposals intact.",
     inputSchema: schema({ edits: { type: "array", minItems: 1, maxItems: 12, items: proposedEdit } }),
   },
   {
@@ -301,7 +308,7 @@ async function openWorkspaceTools(folder, signal, onTool) {
     let after = replacement.replace(/\r\n|\r|\n/g, eol);
     if (after && (end < file.original.length || file.original.endsWith("\n")) && !after.endsWith(eol)) after += eol;
     if (file.original.slice(start, end) === after ||
-        [...changes, ...pending].some((item) => item.path === file.path &&
+        pending.some((item) => item.path === file.path &&
           (item.start === start || (start < item.end && end > item.start)))) {
       throw new Error("The edit in " + file.path + " must be a distinct, nonoverlapping change.");
     }
@@ -311,23 +318,26 @@ async function openWorkspaceTools(folder, signal, onTool) {
   let staging = Promise.resolve();
   function stage(edits) {
     const task = staging.then(async () => {
-      if (!Array.isArray(edits) || !edits.length || edits.length > 12 || edits.length + changes.length > 20) {
+      if (!Array.isArray(edits) || !edits.length || edits.length > 12) {
         throw new Error("Queue up to 12 edits per batch and 20 per request.");
       }
       const pending = [];
       for (const edit of edits) pending.push(await validateEdit(edit, pending));
-      for (const relative of new Set(pending.map((edit) => edit.path))) {
+      const editedPaths = new Set(pending.map(({ path }) => path));
+      const retained = changes.filter(({ path }) => !editedPaths.has(path));
+      if (retained.length + pending.length > 20) throw new Error("Queue up to 20 edits per request.");
+      for (const relative of editedPaths) {
         if (!relative.endsWith(".py")) continue;
         const file = files.get(relative);
         let projected = file.original;
-        for (const edit of [...changes, ...pending].filter((change) => change.path === relative).sort((a, b) => b.start - a.start)) {
+        for (const edit of pending.filter((change) => change.path === relative).sort((a, b) => b.start - a.start)) {
           projected = projected.slice(0, edit.start) + edit.after + projected.slice(edit.end);
         }
         await checkPython(file, projected, signal);
       }
       signal.throwIfAborted();
-      changes.push(...pending);
-      return pending.map(({ path, line }) => ({ queued: true, path, line }));
+      changes.splice(0, changes.length, ...retained, ...pending);
+      return changes.map(({ path, line }) => ({ queued: true, path, line }));
     });
     staging = task.catch(() => {});
     return task;
